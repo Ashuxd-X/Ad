@@ -1,192 +1,163 @@
+import requests
+import time
 import asyncio
-import io
+import json
+import ssl
+import uuid
 import random
-import sys
-import traceback
-from datetime import datetime
-from random import choice, randint
-from time import time
-from typing import Dict, List, NoReturn
-from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from websockets_proxy import Proxy, proxy_connect
+from fake_useragent import UserAgent
+from loguru import logger
+import schedule
+import base64
 
-import aiohttp
-import cv2
-import numpy as np
-from aiohttp_socks import ProxyConnector
-from PIL import Image
-from pyrogram.client import Client
+test_url = 'https://www.google.com'
+encoded_proxy_list_url = 'aHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0VyY2luRGVkZW9nbHUvcHJveGllcy9tYWluL3Byb3hpZXMvc29ja3M1LnR4dA=='
+output_file = 'active_proxies.txt'
+user_ids_file = 'users.txt'
+proxy_list_url = base64.b64decode(encoded_proxy_list_url).decode()
 
-from bot.config.config import settings
-from bot.core.canvas_updater.dynamic_canvas_renderer import DynamicCanvasRenderer
-from bot.core.canvas_updater.websocket_manager import WebSocketManager
-from bot.core.notpx_api_checker import NotPXAPIChecker
-from bot.core.tg_mini_app_auth import TelegramMiniAppAuth
-from bot.utils.json_manager import JsonManager
-from bot.utils.logger import dev_logger, logger
+def check_proxy(proxy):
+    try:
+        session = requests.Session()
+        session.proxies = {'socks5': proxy}
+        response = session.head(test_url, timeout=10)
+        if response.status_code == 200:
+            logger.info(f"Proxy {proxy} is valid.")
+            return proxy
+        else:
+            logger.warning(f"Proxy {proxy} returned status code {response.status_code}.")
+            return None
+    except Exception as e:
+        logger.error(f"Error occurred while checking {proxy}: {e}")
+        return None
 
+def save_active_proxies(proxy_list_url, output_file, max_proxies=2000):
+    try:
+        response = requests.get(proxy_list_url)
+        if response.status_code == 200:
+            proxy_data = response.text.strip().split('\n')
+            random_proxies = random.sample(proxy_data, min(max_proxies, len(proxy_data)))
+            active_proxies = []
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(check_proxy, proxy.strip()) for proxy in random_proxies]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        active_proxies.append(result)
+            random_active_proxies = random.sample(active_proxies, min(355, len(active_proxies)))
+            with open(output_file, 'w') as f:
+                for proxy in random_active_proxies:
+                    f.write(f"http://{proxy}\n")
+            return random_active_proxies
+        else:
+            logger.error(f"Failed to fetch proxy list from {proxy_list_url}. Status code: {response.status_code}")
+            return []
+    except Exception as e:
+        logger.error(f"Error occurred while fetching or processing proxy list from {proxy_list_url}: {e}")
+        return []
 
-class NotPXBot:
-    RETRY_ITERATION_DELAY = 10 * 60  # 10 minutes
-    RETRY_DELAY = 5  # 5 seconds
+def log_reputation(proxy, completeness, consistency, timeliness, availability):
+    logger.info(f"Proxy: {proxy}, Completeness: {completeness}, Consistency: {consistency}, Timeliness: {timeliness}, Availability: {availability}")
 
-    def __init__(
-        self, telegram_client: Client, websocket_manager: WebSocketManager
-    ) -> None:
-        self.telegram_client: Client = telegram_client
-        self.session_name: str = telegram_client.name
-        self.websocket_manager: WebSocketManager = websocket_manager
-        self._headers = self._create_headers()
-        self.template_id: int = 0  # defined in _set_template
-        self.template_url: str = ""  # defined in _set_template
-        self.template_x: int = 0  # defined in _set_template
-        self.template_y: int = 0  # defined in _set_template
-        self.template_size: int = 0  # defined in _set_template
-        self.balance = 0  # Initialize balance
-        self.max_boosts: Dict[str, int] = {
-            "paintReward": 7,
-            "reChargeSpeed": 11,
-            "energyLimit": 7,
-        }
-        self.boost_prices: Dict[str, Dict[int, int]] = {
-            "paintReward": {2: 5, 3: 100, 4: 200, 5: 300, 6: 500, 7: 600},
-            "reChargeSpeed": {
-                2: 5,
-                3: 100,
-                4: 200,
-                5: 300,
-                6: 400,
-                7: 500,
-                8: 600,
-                9: 700,
-                10: 800,
-                11: 900,
-            },
-            "energyLimit": {2: 5, 3: 100, 4: 200, 5: 300, 6: 400, 7: 10},
-        }
-        self._canvas_renderer: DynamicCanvasRenderer = DynamicCanvasRenderer()
-        self._tasks_list: Dict[str, Dict[str, str]] = {
-            "x_tasks_list": {
-                "x:notpixel": "notpixel",
-                "x:notcoin": "notcoin",
-            },
-            "channel_tasks_list": {
-                "channel:notpixel_channel": "notpixel_channel",
-                "channel:notcoin": "notcoin",
-            },
-            "league_tasks_list": {
-                "leagueBonusSilver": "leagueBonusSilver",
-                "leagueBonusGold": "leagueBonusGold",
-                "leagueBonusPlatinum": "leagueBonusPlatinum",
-            },
-            "click_tasks_list": {},
-        }
-        self._tasks_to_complete: Dict[str, Dict[str, str]] = {}
-        self._league_weights: Dict[str, int] = {
-            "bronze": 0,
-            "silver": 1,
-            "gold": 2,
-            "platinum": 3,
-        }
-        self._quests_list: List[str] = [
-            "secretWord:happy halloween",
-        ]
-        self._quests_to_complete: List[str] = []
-        self._notpx_api_checker: NotPXAPIChecker = NotPXAPIChecker()
+async def connect_to_wss(socks5_proxy, user_id, traffic_type='PET'):
+    device_id = str(uuid.uuid3(uuid.NAMESPACE_DNS, socks5_proxy))
+    logger.info(device_id)
+    user_agent = UserAgent()
+    random_user_agent = user_agent.random
 
-    def _create_headers(self) -> Dict[str, Dict[str, str]]:
-        base_headers = {
-            "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://app.notpx.app",
-            "Referer": "https://app.notpx.app/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-            "User-Agent": "",
-        }
-
-        websocket_headers = {
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Sec-Fetch-Dest": "websocket",
-            "Sec-Fetch-Mode": "websocket",
-            "Sec-Fetch-Site": "same-site",
-        }
-
-        def create_headers(additional_headers=None):
-            headers = base_headers.copy()
-            if additional_headers:
-                headers.update(additional_headers)
-            return headers
-
-        return {
-            "notpx": create_headers({"Authorization": ""}),
-            "tganalytics": create_headers(),
-            "plausible": create_headers({"Sec-Fetch-Site": "cross-site"}),
-            "websocket": create_headers(websocket_headers),
-            "image_notpx": create_headers(),
-        }
-
-    async def run(self, user_agent: str, proxy: str | None) -> NoReturn:
-        for header in self._headers.values():
-            header["User-Agent"] = user_agent
-
-        self.proxy = proxy
-
-        while True:
-            try:
-                proxy_connector = ProxyConnector().from_url(proxy) if proxy else None
-                async with aiohttp.ClientSession(connector=proxy_connector) as session:
-                    # Add the ad-watching feature here
-                    if settings.WATCH_ADS:
-                        await self._watch_ads(session)
-
-                    # Existing workflows continue here.
-                    # For example: task handling, painting, claiming rewards.
-            except Exception as error:
-                logger.error(f"{self.session_name} | Error occurred: {error}")
-                await asyncio.sleep(self.RETRY_ITERATION_DELAY)
-
-    async def _watch_ads(self, http_client: aiohttp.ClientSession):
-        """
-        Watch ads and claim rewards.
-        """
-        logger.info(f"{self.session_name} | Starting ad-watching loop.")
-        headers = self._headers["notpx"]
-        base_url = "https://notpx.app/api/v1/ads"
-
+    while True:
         try:
-            while True:
-                # Step 1: Fetch ad information
-                response = await http_client.get(base_url, headers=headers)
-                if response.status == 200:
-                    ad_data = await response.json()
-                    render_url = ad_data['banner']['trackings'][0]['value']
-                    show_url = ad_data['banner']['trackings'][1]['value']
-                    reward_url = ad_data['banner']['trackings'][4]['value']
+            await asyncio.sleep(1)
+            custom_headers = {"User-Agent": random_user_agent}
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
 
-                    # Step 2: Render ad
-                    await http_client.get(render_url, headers=headers)
-                    logger.info(f"{self.session_name} | Ad render tracked.")
+            uri = "wss://proxy.wynd.network:4650/"
+            server_hostname = "proxy.wynd.network"
+            proxy = Proxy.from_url(socks5_proxy)
 
-                    # Step 3: Simulate viewing the ad
-                    await asyncio.sleep(10)  # Simulate watching ad
+            async with proxy_connect(uri, proxy=proxy, ssl=ssl_context, server_hostname=server_hostname,
+                                     extra_headers=custom_headers) as websocket:
+                async def send_ping():
+                    while True:
+                        send_message = json.dumps(
+                            {"id": str(uuid.uuid4()), "version": "1.0.0", "action": "PING", "data": {}})
+                        try:
+                            await websocket.send(send_message)
+                            logger.debug(send_message)
+                        except Exception as e:
+                            logger.error(f"Failed to send PING: {e}")
+                        await asyncio.sleep(2)
 
-                    # Step 4: Track ad as shown
-                    await http_client.get(show_url, headers=headers)
-                    logger.info(f"{self.session_name} | Ad show tracked.")
+                asyncio.create_task(send_ping())
 
-                    # Step 5: Claim reward
-                    reward_response = await http_client.get(reward_url, headers=headers)
-                    reward_response.raise_for_status()
-                    reward_data = await reward_response.json()
-                    reward_amount = reward_data.get("reward", 0)
-                    self.balance += reward_amount  # Update bot's balance
-                    logger.info(f"{self.session_name} | Ad reward claimed: {reward_amount} PX.")
+                while True:
+                    response = await websocket.recv()
+                    message = json.loads(response)
+                    logger.info(message)
 
-                else:
-                    logger.info(f"{self.session_name} | No ads available, exiting loop.")
-                    break
-        except Exception as error:
-            logger.error(f"{self.session_name} | Error watching ads: {error}")
+                    completeness = True 
+                    consistency = True
+                    timeliness = True 
+                    availability = True 
 
-    # Rest of the existing methods in NotPXBot remain unchanged.
+                    log_reputation(socks5_proxy, completeness, consistency, timeliness, availability)
+
+                    if message.get("action") == "AUTH":
+                        auth_response = {
+                            "id": message["id"],
+                            "origin_action": "AUTH",
+                            "result": {
+                                "browser_id": device_id,
+                                "user_id": user_id,
+                                "user_agent": custom_headers['User-Agent'],
+                                "timestamp": int(time.time()),
+                                "device_type": "extension",
+                                "version": "3.3.2"
+                            }
+                        }
+                        try:
+                            await websocket.send(json.dumps(auth_response))
+                            logger.debug(auth_response)
+                        except Exception as e:
+                            logger.error(f"Failed to send AUTH response: {e}")
+
+                    elif message.get("action") == "PONG":
+                        pong_response = {"id": message["id"], "origin_action": "PONG"}
+                        try:
+                            await websocket.send(json.dumps(pong_response))
+                            logger.debug(pong_response)
+                        except Exception as e:
+                            logger.error(f"Failed to send PONG response: {e}")
+
+        except Exception as e:
+            pass 
+            await asyncio.sleep(10) 
+
+async def main():
+    with open(user_ids_file, 'r') as file:
+        user_ids = file.read().splitlines()
+
+    with open(output_file, 'r') as file:
+        socks5_proxy_list = file.read().splitlines()
+
+    tasks = [asyncio.ensure_future(connect_to_wss(proxy, user_id.strip(), traffic_type='PET')) for user_id in user_ids for proxy in socks5_proxy_list]
+    await asyncio.gather(*tasks)
+
+def perform_job():
+    active_proxies = save_active_proxies(proxy_list_url, output_file)
+    if active_proxies:
+        asyncio.run(main())
+    else:
+        logger.error("No active proxies found. Skipping WebSocket connections.")
+
+schedule.every(24).hours.do(perform_job)
+
+perform_job()
+
+while True:
+    schedule.run_pending()
+    time.sleep(1)
